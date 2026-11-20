@@ -1,10 +1,15 @@
-# 图纸分块定位 API
+# 图纸分块定位与透印复核 API
 
-把大幅图纸切块扫描得到的多张图块，按**已声明的重叠图对**和每对的整数平移搜索窗，
-求出各块在整图上的位置。只有所有指定图对同时达标且相对布局唯一时，才返回以
-**首图左上角为原点**的拼接坐标。
+两个面向档案数字化的服务：
 
-技术栈：FastAPI + NumPy（Pillow 仅用于 PNG 解码）。提供 Docker Compose 与可交互的
+1. **分块定位 `/align`**：把大幅图纸切块扫描得到的多张图块，按**已声明的重叠图对**和每对的
+   整数平移搜索窗，求出各块在整图上的位置。只有所有指定图对同时达标且相对布局唯一时，才返回以
+   **首图左上角为原点**的拼接坐标。
+2. **透印复核 `/review`**：薄纸图纸背面的线条会透到正面。对**已镜像对齐**的正/背面灰度扫描，
+   在整数透印模型下枚举所有可行复原，把正面像素标注为“确认有墨（黑）/确认无墨（白）/存疑需查
+   原件（灰）”。
+
+技术栈：FastAPI + NumPy（Pillow 仅用于 PNG 编解码）。提供 Docker Compose 与可交互的
 `/docs`。
 
 ## 快速启动
@@ -14,12 +19,14 @@ docker compose up --build
 # 打开 http://localhost:8000/docs
 ```
 
-生成一套演示图与请求：
+生成演示图与请求（对齐演示与复核演示二选一）：
 
 ```bash
-python scripts/make_demo.py demo          # 需要先 pip install -r requirements-dev.txt
-docker compose up --build                 # 另一个终端
-bash demo/request.sh                      # 期望 status = "aligned"
+python scripts/make_demo.py          # 对齐演示：demo/tileN.png + spec.json + request.sh
+python scripts/make_demo.py review   # 复核演示：demo/front.png、back.png + review_spec.json
+docker compose up --build            # 另一个终端
+bash demo/request.sh                 # 对齐演示，期望 status = "aligned"
+bash demo/review_request.sh          # 复核演示，产出 demo/review.png，元数据见 demo/review_headers.txt
 ```
 
 不用 Docker 时：
@@ -101,6 +108,62 @@ HTTP 状态码只表示请求是否合法；对齐结论在 `status` 字段（�
 错误返回：`400` 图像非法（格式/位深/颜色类型/尺寸/数量/`Content-Type`）或 `spec` 不是 JSON；
 `422` `spec` 结构不合法、图号越界、图对重复。
 
+## 透印复核接口 `POST /review`
+
+`multipart/form-data`：
+
+| 字段 | 说明 |
+| --- | --- |
+| `front` | 正面 **8 位灰度 PNG**（颜色类型 0、非隔行、每边 ≤ 1024 px），已与背面对齐 |
+| `back` | 背面 8 位灰度 PNG，**已镜像**并与正面同尺寸对齐 |
+| `spec` | JSON 字符串，结构见下 |
+
+### spec 结构
+
+```json
+{
+  "front_ink_free": [{"x": 12, "y": 30}],
+  "back_ink_free": [{"x": 12, "y": 31}, {"x": 0, "y": 0}],
+  "front_ink_threshold": 100
+}
+```
+
+* `front_ink_free` / `back_ink_free`：该面**确认无墨**的像素坐标（`x` 为列、`y` 为行，从 0 起），
+  每面至少 1 个、至多 100 个；坐标必须落在图像范围内。
+* `front_ink_threshold`：正面墨迹**深度**阈值，1～255 的整数。
+
+### 透印模型
+
+灰度转深度：`深度 = 255 - 灰度`，真实深度 `f`（正面）/ `b`（背面）均为 0～255 的整数。
+每面各有一个**全图共用**的透印系数 `kf` / `kb`，取值 0～5 的整数。每个对齐像素：
+
+```
+正面观测深度 F = min(255, f + floor(kf * b / 10))
+背面观测深度 B = min(255, b + floor(kb * f / 10))
+```
+
+无墨坐标把标记一面在该像素的真实深度钉为 0。**可行复原** = 一组 `(kf, kb)` 与每个像素的
+`(f, b)`，能在所有像素同时复现两面观测并满足无墨标记。
+
+### 求解与输出
+
+服务枚举全部 36 个系数对。系数固定后各像素互相独立，因此对每个系数对逐像素判定可行性，
+只保留在**每个像素**都可行的系数对；再对这些系数对求正面真实深度 `f` 的逐像素最小/最大值。
+返回与正面同尺寸的 8 位灰度 PNG：
+
+| 输出灰度 | 含义 |
+| --- | --- |
+| 黑 `0` | 所有可行复原中 `f` 都 **≥ 阈值**（确认正面有墨） |
+| 白 `255` | 所有可行复原中 `f` 都 **< 阈值**（确认正面无墨） |
+| 灰 `127` | 部分可行复原达到阈值、部分低于，结论不唯一，交档案员查原件 |
+
+响应头 `X-Review-Meta`（ASCII 编码 JSON）给出可行系数对列表与黑/白/灰像素计数。
+**不存在任何可行复原**时返回 `422`，响应体只提示“扫描图与透印模型不符”，不返回图像；
+诊断信息（每个系数对无法解释的像素数、最接近的系数对）在 `X-Review-Meta` 中。
+
+错误返回：`400` 图像非法、两面尺寸不一致、坐标越界或 `spec` 不是 JSON；
+`422` `spec` 结构不合法（字段缺失、阈值越界等），或无可行复原。
+
 ## 实现要点
 
 * **解码**：先读 PNG 的 `IHDR` 校验位深=8、颜色类型=0、非隔行、边长≤1024，再用 Pillow 解码并核对尺寸，
@@ -110,20 +173,27 @@ HTTP 状态码只表示请求是否合法；对齐结论在 `status` 字段（�
 * **求解**：见上，`MAX_LAYOUTS` / `MAX_NODES_EXPANDED` 限制最坏工作量；超限时返回
   `ambiguous` 且 `search_truncated=true`，把所有非基准图列为不确定——宁可说不确定，也不谎报唯一。
   预算在尚未找到任何布局时就耗尽的，同样报 `ambiguous` 而不是 `no_solution`，因为此时无法证明无解。
+* **透印复核**：固定 `(kf, kb)` 后只有 256×256 种真实深度组合，且每种组合确定性映射到一个观测对。
+  启动后按需构建并缓存 36 组查找表（每种系数对一组，按 4 种无墨约束模式分别记录“是否可行”与
+  正面深度的最小/最大值），请求处理只做逐像素查表，无需逐像素搜索、不依赖 SciPy。1024×1024
+  全图冷启动（含建表）实测约 1 秒、热请求约 0.5 秒，峰值内存约 130 MiB。可行性按**全图共用一个
+  系数对**判定：某系数对只要有一个像素无法解释即整体排除，避免把只在局部成立的系数混入结论。
 
 ## 目录
 
 ```
 app/
-  main.py       FastAPI 路由、spec 解析与错误映射
+  main.py       FastAPI 路由、spec 解析与错误映射（/align 与 /review）
   models.py     Pydantic 请求/响应模型与上限常量
   imaging.py    严格 PNG 解码、重叠矩形
   alignment.py  单图对搜索窗打分
   solver.py     全局布局枚举与唯一性判定
-  service.py    编排：连通性 → 打分 → 求解
-tests/          37 个测试（求解器单测 + HTTP 端到端）
-scripts/        make_demo.py 生成演示数据；demo_client.py 直接调用运行中的服务；
-                demo_data.py 生成演示图（不依赖 tests/）
+  showthrough.py  透印模型查找表、逐像素可行性与正面深度包络
+  review_service.py 复核编排：无墨掩码、求解、PNG 编码与元数据
+  service.py    对齐编排：连通性 → 打分 → 求解
+tests/          76 个测试（求解器/透印单测 + 两个接口的 HTTP 端到端）
+scripts/        make_demo.py 生成对齐或复核演示数据；demo_client.py 调用运行中的对齐服务；
+                demo_data.py / review_demo.py 生成演示图（不依赖 tests/）
 Dockerfile      python:3.11-slim、非 root、HEALTHCHECK
 docker-compose.yml  端口 8000、只读根文件系统、健康检查
 ```
@@ -135,3 +205,6 @@ docker-compose.yml  端口 8000、只读根文件系统、健康检查
   `ambiguous` 而不是猜测。
 * MAD 使用全图块的重叠矩形直接比较，不做事先的亮度/对比度归一化；扫描曝光差异需通过
   `max_mean_abs_diff` 放宽，或由扫描端统一曝光。
+* 透印复核假定输入已经镜像并像素级对齐，且透印在每面全图只用一个整数系数、模型为饱和加法；
+  真实扫描若含传感器噪声、非线性曝光或局部晕染，可能出现整体无可行复原（此时按设计返回 422，
+  不猜测结果）。无墨标记的准确性直接决定结论，标记错误会使整组复原被排除。

@@ -1,4 +1,4 @@
-"""Pydantic request/response models for the tile-alignment API."""
+"""Pydantic request/response models for the tile-alignment and review APIs."""
 
 from __future__ import annotations
 
@@ -11,6 +11,13 @@ MAX_IMAGES = 5
 MAX_IMAGE_SIDE = 1024
 MAX_WINDOW_POSITIONS = 81
 MAX_PAIRS = MAX_IMAGES * (MAX_IMAGES - 1) // 2
+
+# Show-through review limits.
+MAX_INK_FREE_POINTS = 100
+INK_THRESHOLD_MIN = 1
+INK_THRESHOLD_MAX = 255
+SHOWTHROUGH_K_MIN = 0
+SHOWTHROUGH_K_MAX = 5
 
 
 class WindowSpec(BaseModel):
@@ -184,3 +191,57 @@ class AlignResponse(BaseModel):
     search_truncated: bool = Field(
         default=False, description="候选组合数达到搜索上限时为 true，唯一性未获证明"
     )
+
+
+# ---------------------------------------------------------------------------
+# Show-through review
+# ---------------------------------------------------------------------------
+
+
+class PixelPoint(BaseModel):
+    """One pixel coordinate; ``x`` is the column, ``y`` the row, zero-based."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    x: StrictInt = Field(ge=0, le=MAX_IMAGE_SIDE - 1)
+    y: StrictInt = Field(ge=0, le=MAX_IMAGE_SIDE - 1)
+
+
+class ReviewSpec(BaseModel):
+    """Request metadata for ``POST /review`` (sent as a JSON string in the form).
+
+    ``front_ink_free`` / ``back_ink_free`` list confirmed ink-free pixel
+    coordinates of the corresponding side; each side needs at least one.
+    ``front_ink_threshold`` is an integer depth threshold in 1..255: a front
+    pixel whose true depth reaches it in every feasible reconstruction is
+    reported as confirmed ink.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    front_ink_free: list[PixelPoint] = Field(min_length=1, max_length=MAX_INK_FREE_POINTS)
+    back_ink_free: list[PixelPoint] = Field(min_length=1, max_length=MAX_INK_FREE_POINTS)
+    front_ink_threshold: StrictInt = Field(ge=INK_THRESHOLD_MIN, le=INK_THRESHOLD_MAX)
+
+    def front_points(self) -> list[tuple[int, int]]:
+        return [(p.x, p.y) for p in self.front_ink_free]
+
+    def back_points(self) -> list[tuple[int, int]]:
+        return [(p.x, p.y) for p in self.back_ink_free]
+
+
+class ReviewMeta(BaseModel):
+    """JSON metadata returned alongside the review PNG (in a response header)."""
+
+    status: Literal["reviewed", "infeasible"]
+    message: str
+    width: int
+    height: int
+    front_ink_threshold: int
+    feasible_coefficients: list[tuple[int, int]] = Field(
+        default_factory=list,
+        description="所有可同时复现两面观测的 (正面 k, 背面 k) 系数对",
+    )
+    ink_pixels: int | None = Field(default=None, description="标黑像素数（确认正面有墨）")
+    blank_pixels: int | None = Field(default=None, description="标白像素数（确认正面无墨）")
+    uncertain_pixels: int | None = Field(default=None, description="标灰像素数（需查原件）")

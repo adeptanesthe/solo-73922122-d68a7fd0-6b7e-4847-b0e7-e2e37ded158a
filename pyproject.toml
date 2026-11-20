@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tile-align-api"
 version = "1.0.0"
-description = "Locate scanned tiles of a large-format drawing via declared pairwise translations"
+description = "Tile alignment and two-sided show-through review API for scanned large-format drawings"
 requires-python = ">=3.11"
 dependencies = [
     "numpy==2.4.6",

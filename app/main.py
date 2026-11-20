@@ -1,16 +1,24 @@
-"""FastAPI application for locating scan tiles of a large-format drawing."""
+"""FastAPI application for tile alignment and show-through review."""
 
 from __future__ import annotations
 
 import json
 from typing import Annotated
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from pydantic import ValidationError
 
 from . import __version__
-from .imaging import ImageDecodeError, decode_grayscale_png
-from .models import MAX_IMAGES, MAX_PAIRS, MIN_IMAGES, AlignResponse, AlignSpec
+from .imaging import DecodedImage, ImageDecodeError, decode_grayscale_png
+from .models import (
+    MAX_IMAGES,
+    MAX_PAIRS,
+    MIN_IMAGES,
+    AlignResponse,
+    AlignSpec,
+    ReviewSpec,
+)
+from .review_service import ReviewError, run_review
 from .service import align
 
 DESCRIPTION = """
@@ -53,11 +61,33 @@ DESCRIPTION = """
 在上方 `/docs` 页面点击 **Try it out**，先添加 3 张图，再把该 JSON（或 `scripts/make_demo.py`
 生成的 `demo/spec.json`）粘贴到 `spec` 字段即可试用。窗口面积两类写法都受 81 个位置的上限约束：
 矩形窗口按 `(dx_max-dx_min+1)*(dy_max-dy_min+1) ≤ 81` 计，`candidates` 按条数计。
+
+## 透印复核 `/review`
+
+薄纸图纸背面的线条会透到正面。上传**已镜像对齐**的正/背面 8 位灰度 PNG（同尺寸、
+每边 ≤ 1024 px），以及两面各自至少一个**确认无墨**的像素坐标和正面墨迹深度阈值
+（1～255 的整数）。深度定义为 `255 - 灰度`，取 0～255 的整数。
+
+透印模型：每面各有一个全图共用的透印系数 `kf` / `kb`（整数 0～5）。对每个对齐像素，
+设正面真实深度 `f`、背面真实深度 `b`，则
+
+* 正面观测深度 `F = min(255, f + floor(kf*b/10))`
+* 背面观测深度 `B = min(255, b + floor(kb*f/10))`
+
+无墨坐标把标记一面在该像素的真实深度钉为 0。服务枚举全部 36 个系数对，只保留能在
+**每个像素**同时复现两面观测且满足无墨标记的复原。返回与正面同尺寸的灰度 PNG：
+
+* **黑 (0)**：在所有可行复原中正面真实深度都达到阈值（确认有墨）；
+* **白 (255)**：在所有可行复原中都低于阈值（确认无墨）；
+* **灰 (127)**：结论随可行复原变化，交档案员查原件。
+
+不存在任何可行复原时返回 422，只提示扫描图与透印模型不符（不返回图像）。
+复核元数据（可行系数对、黑/白/灰像素计数）在响应头 `X-Review-Meta`（JSON）中。
 """
 
 
 app = FastAPI(
-    title="图纸分块定位 API",
+    title="图纸分块定位与透印复核 API",
     version=__version__,
     description=DESCRIPTION,
     docs_url="/docs",
@@ -150,3 +180,80 @@ def align_endpoint(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return align(decoded, parsed)
+
+
+def _parse_review_spec(spec_text: str) -> ReviewSpec:
+    try:
+        raw = json.loads(spec_text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"spec 不是合法 JSON：{exc}") from exc
+    try:
+        return ReviewSpec.model_validate(raw)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=json.loads(exc.json(include_url=False, include_context=False)),
+        ) from exc
+
+
+def _decode_review_image(upload: UploadFile, side: str) -> DecodedImage:
+    ctype = (upload.content_type or "").split(";")[0].strip().lower()
+    if ctype not in ("image/png", "application/octet-stream", ""):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{side}的 Content-Type 为 {upload.content_type!r}，只接受 image/png",
+        )
+    data = _read_upload(upload, side)
+    try:
+        return decode_grayscale_png(0 if side == "正面" else 1, data)
+    except ImageDecodeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/review",
+    tags=["show-through"],
+    summary="透印复核：区分正面真墨迹与背面透印，返回三值标注 PNG",
+    response_class=Response,
+    responses={
+        200: {
+            "content": {"image/png": {}},
+            "description": "复核标注图（与正面同尺寸的 8 位灰度 PNG）；元数据见响应头 X-Review-Meta",
+        },
+        400: {"description": "请求格式或图像不符合要求"},
+        422: {"description": "spec 结构不合法，或无可行复原（扫描图与透印模型不符）"},
+    },
+)
+def review_endpoint(
+    front: Annotated[UploadFile, File(description="正面 8 位灰度 PNG（已与背面对齐）")],
+    back: Annotated[UploadFile, File(description="背面 8 位灰度 PNG（已镜像、与正面对齐）")],
+    spec: Annotated[str, Form(description="ReviewSpec JSON 字符串（见接口说明）")],
+) -> Response:
+    parsed = _parse_review_spec(spec)
+    front_img = _decode_review_image(front, "正面")
+    back_img = _decode_review_image(back, "背面")
+
+    try:
+        png, meta = run_review(front_img, back_img, parsed)
+    except ReviewError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # HTTP headers must be latin-1; ensure_ascii keeps the metadata pure ASCII.
+    header = json.dumps(meta.model_dump(), ensure_ascii=True)
+    if meta.status != "reviewed":
+        # No feasible reconstruction: only signal the model mismatch, no image.
+        raise HTTPException(
+            status_code=422,
+            detail="无可行复原：扫描图与透印模型不符（不存在能同时复现两面全部观测"
+            "并满足无墨标记的透印系数与真实深度组合）",
+            headers={"X-Review-Meta": header},
+        )
+
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={
+            "X-Review-Meta": header,
+            "Content-Disposition": 'inline; filename="review.png"',
+        },
+    )
